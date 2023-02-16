@@ -20,6 +20,8 @@ import (
 	"crypto/tls"
 	"io"
 	"io/ioutil"
+	"log"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
@@ -32,7 +34,7 @@ import (
 
 // Max size of the buffer of result channel.
 const maxResult = 1000000
-const maxIdleConn = 500
+const maxIdleConn = 500000
 
 type result struct {
 	err           error
@@ -49,13 +51,15 @@ type result struct {
 
 type Work struct {
 	// Request is the request to be made.
+	LocalAddr net.Addr
+
 	Request *http.Request
 
 	RequestBody []byte
 
 	// RequestFunc is a function to generate requests. If it is nil, then
 	// Request and RequestData are cloned for each request.
-	RequestFunc func() *http.Request
+	RequestFunc func(goroutineIdx int, requestIdx int) *http.Request
 
 	// N is the total number of requests to make.
 	N int
@@ -144,7 +148,7 @@ func (b *Work) Finish() {
 	b.report.finalize(total)
 }
 
-func (b *Work) makeRequest(c *http.Client) {
+func (b *Work) makeRequest(c *http.Client, gIdx int, requestIdx int) {
 	s := now()
 	var size int64
 	var code int
@@ -152,7 +156,7 @@ func (b *Work) makeRequest(c *http.Client) {
 	var dnsDuration, connDuration, resDuration, reqDuration, delayDuration time.Duration
 	var req *http.Request
 	if b.RequestFunc != nil {
-		req = b.RequestFunc()
+		req = b.RequestFunc(gIdx, requestIdx)
 	} else {
 		req = cloneRequest(b.Request, b.RequestBody)
 	}
@@ -206,7 +210,7 @@ func (b *Work) makeRequest(c *http.Client) {
 	}
 }
 
-func (b *Work) runWorker(client *http.Client, n int) {
+func (b *Work) runWorker(client *http.Client, n int, gIdx int) {
 	var throttle <-chan time.Time
 	if b.QPS > 0 {
 		throttle = time.Tick(time.Duration(1e6/(b.QPS)) * time.Microsecond)
@@ -226,7 +230,7 @@ func (b *Work) runWorker(client *http.Client, n int) {
 			if b.QPS > 0 {
 				<-throttle
 			}
-			b.makeRequest(client)
+			b.makeRequest(client, gIdx, i)
 		}
 	}
 }
@@ -238,12 +242,22 @@ func (b *Work) runWorkers() {
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
-			ServerName:         b.Request.Host,
+			// ServerName:         b.Request.Host,
 		},
 		MaxIdleConnsPerHost: min(b.C, maxIdleConn),
 		DisableCompression:  b.DisableCompression,
 		DisableKeepAlives:   b.DisableKeepAlives,
 		Proxy:               http.ProxyURL(b.ProxyAddr),
+	}
+	log.Println("local addr is nil? ", b.LocalAddr == nil)
+	log.Println("local addr is  ", b.LocalAddr)
+
+	if b.LocalAddr != nil {
+		tr.DialContext = (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+			LocalAddr: b.LocalAddr,
+		}).DialContext
 	}
 	if b.H2 {
 		http2.ConfigureTransport(tr)
@@ -254,10 +268,10 @@ func (b *Work) runWorkers() {
 
 	// Ignore the case where b.N % b.C != 0.
 	for i := 0; i < b.C; i++ {
-		go func() {
-			b.runWorker(client, b.N/b.C)
+		go func(gIdx int) {
+			b.runWorker(client, b.N/b.C, gIdx)
 			wg.Done()
-		}()
+		}(i)
 	}
 	wg.Wait()
 }
